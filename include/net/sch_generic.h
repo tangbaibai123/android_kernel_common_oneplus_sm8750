@@ -41,13 +41,6 @@ enum qdisc_state_t {
 	__QDISC_STATE_DRAINING,
 };
 
-enum qdisc_state2_t {
-	/* Only for !TCQ_F_NOLOCK qdisc. Never access it directly.
-	 * Use qdisc_run_begin/end() or qdisc_is_running() instead.
-	 */
-	__QDISC_STATE2_RUNNING,
-};
-
 #define QDISC_STATE_MISSED	BIT(__QDISC_STATE_MISSED)
 #define QDISC_STATE_DRAINING	BIT(__QDISC_STATE_DRAINING)
 
@@ -117,12 +110,23 @@ struct Qdisc {
 	struct qdisc_skb_head	q;
 	struct gnet_stats_basic_sync bstats;
 	struct gnet_stats_queue	qstats;
+#ifndef __GENKSYMS__
+	bool			running; /* must be written under qdisc spinlock */
+#endif
 	unsigned long		state;
-	unsigned long		state2; /* must be written under qdisc spinlock */
+#ifdef __GENKSYMS__
+	unsigned long		state2;
+#endif
 	struct Qdisc            *next_sched;
 	struct sk_buff_head	skb_bad_txq;
 
+#ifdef __GENKSYMS__
 	spinlock_t		busylock ____cacheline_aligned_in_smp;
+#else
+	atomic_long_t		defer_count ____cacheline_aligned_in_smp;
+	struct llist_head	defer_list;
+#endif
+
 	spinlock_t		seqlock;
 
 	struct rcu_head		rcu;
@@ -169,7 +173,7 @@ static inline bool qdisc_is_running(struct Qdisc *qdisc)
 {
 	if (qdisc->flags & TCQ_F_NOLOCK)
 		return spin_is_locked(&qdisc->seqlock);
-	return test_bit(__QDISC_STATE2_RUNNING, &qdisc->state2);
+	return READ_ONCE(qdisc->running);
 }
 
 static inline bool nolock_qdisc_is_empty(const struct Qdisc *qdisc)
@@ -212,7 +216,10 @@ static inline bool qdisc_run_begin(struct Qdisc *qdisc)
 		 */
 		return spin_trylock(&qdisc->seqlock);
 	}
-	return !__test_and_set_bit(__QDISC_STATE2_RUNNING, &qdisc->state2);
+	if (READ_ONCE(qdisc->running))
+		return false;
+	WRITE_ONCE(qdisc->running, true);
+	return true;
 }
 
 static inline void qdisc_run_end(struct Qdisc *qdisc)
@@ -230,7 +237,7 @@ static inline void qdisc_run_end(struct Qdisc *qdisc)
 				      &qdisc->state)))
 			__netif_schedule(qdisc);
 	} else {
-		__clear_bit(__QDISC_STATE2_RUNNING, &qdisc->state2);
+		WRITE_ONCE(qdisc->running, false);
 	}
 }
 

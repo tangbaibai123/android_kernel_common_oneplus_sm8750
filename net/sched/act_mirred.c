@@ -29,9 +29,6 @@
 static LIST_HEAD(mirred_list);
 static DEFINE_SPINLOCK(mirred_list_lock);
 
-#define MIRRED_NEST_LIMIT    4
-static DEFINE_PER_CPU(unsigned int, mirred_nest_level);
-
 static bool tcf_mirred_is_act_redirect(int action)
 {
 	return action == TCA_EGRESS_REDIR || action == TCA_INGRESS_REDIR;
@@ -308,17 +305,20 @@ TC_INDIRECT_SCOPE int tcf_mirred_act(struct sk_buff *skb,
 {
 	struct tcf_mirred *m = to_mirred(a);
 	int retval = READ_ONCE(m->tcf_action);
-	unsigned int nest_level;
+	struct netdev_xmit *xmit;
 	bool m_mac_header_xmit;
 	struct net_device *dev;
-	int m_eaction;
+	int i, m_eaction;
 
-	nest_level = __this_cpu_inc_return(mirred_nest_level);
-	if (unlikely(nest_level > MIRRED_NEST_LIMIT)) {
+#ifdef CONFIG_PREEMPT_RT
+	xmit = &current->net_xmit;
+#else
+	xmit = this_cpu_ptr(&softnet_data.xmit);
+#endif
+	if (unlikely(xmit->sched_mirred_nest >= MIRRED_NEST_LIMIT)) {
 		net_warn_ratelimited("Packet exceeded mirred recursion limit on dev %s\n",
 				     netdev_name(skb->dev));
-		retval = TC_ACT_SHOT;
-		goto dec_nest_level;
+		return TC_ACT_SHOT;
 	}
 
 	tcf_lastuse_update(&m->tcf_tm);
@@ -328,17 +328,25 @@ TC_INDIRECT_SCOPE int tcf_mirred_act(struct sk_buff *skb,
 	if (unlikely(!dev)) {
 		pr_notice_once("tc mirred: target device is gone\n");
 		tcf_action_inc_overlimit_qstats(&m->common);
-		goto dec_nest_level;
+		return retval;
 	}
+	for (i = 0; i < xmit->sched_mirred_nest; i++) {
+		if (xmit->sched_mirred_dev[i] != dev)
+			continue;
+		pr_notice_once("tc mirred: loop on device %s\n",
+			       netdev_name(dev));
+		tcf_action_inc_overlimit_qstats(&m->common);
+		return retval;
+	}
+
+	xmit->sched_mirred_dev[xmit->sched_mirred_nest++] = dev;
 
 	m_mac_header_xmit = READ_ONCE(m->tcfm_mac_header_xmit);
 	m_eaction = READ_ONCE(m->tcfm_eaction);
 
 	retval = tcf_mirred_to_dev(skb, m, dev, m_mac_header_xmit, m_eaction,
 				   retval);
-
-dec_nest_level:
-	__this_cpu_dec(mirred_nest_level);
+	xmit->sched_mirred_nest--;
 
 	return retval;
 }

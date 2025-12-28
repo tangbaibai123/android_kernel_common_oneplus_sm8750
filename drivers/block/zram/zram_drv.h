@@ -50,7 +50,7 @@ enum zram_pageflags {
 	ZRAM_LOCK = ZRAM_FLAG_SHIFT,
 	ZRAM_SAME,	/* Page consists the same element */
 	ZRAM_WB,	/* page is stored on backing_device */
-	ZRAM_UNDER_WB,	/* page is under writeback */
+	ZRAM_PP_SLOT,	/* Selected for post-processing */
 	ZRAM_HUGE,	/* Incompressible page */
 	ZRAM_IDLE,	/* not accessed page since last idle marking */
 	ZRAM_INCOMPRESSIBLE, /* none of the algorithms could compress it */
@@ -78,8 +78,8 @@ struct zram_table_entry {
 
 #ifdef CONFIG_ZRAM_WRITEBACK
 struct zram_shrink_ctx {
-    struct zram *zram;
-    bool *encountered_in_swapcache;
+	struct zram *zram;
+	struct zram_pp_ctl *ctl;
 };
 #endif
 
@@ -153,10 +153,41 @@ struct zram {
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
 #endif
+	atomic_t pp_in_progress;
 #ifdef CONFIG_ZRAM_AUTO_SIZE
 	unsigned int historical_mem_pressure;
 	unsigned int historical_zram_pressure;
 	spinlock_t pressure_lock; 
 #endif
 };
+
+void zram_slot_lock(struct zram *zram, u32 index);
+void zram_slot_unlock(struct zram *zram, u32 index);
+void zram_set_handle(struct zram *zram, u32 index, unsigned long handle);
+bool zram_test_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
+void zram_set_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
+void zram_free_page(struct zram *zram, size_t index);
+
+#if defined CONFIG_ZRAM_WRITEBACK || defined CONFIG_ZRAM_MULTI_COMP
+struct zram_pp_slot {
+	unsigned long		index;
+	struct list_head	entry;
+};
+
+/*
+ * A post-processing bucket is, essentially, a size class, this defines
+ * the range (in bytes) of pp-slots sizes in particular bucket.
+ */
+#define PP_BUCKET_SIZE_RANGE	64
+#define NUM_PP_BUCKETS		((PAGE_SIZE / PP_BUCKET_SIZE_RANGE) + 1)
+
+struct zram_pp_ctl {
+	struct list_head	pp_buckets[NUM_PP_BUCKETS];
+	struct completion	all_done;
+	atomic_t		num_pp_slots;
+};
+
+void free_pp_slot(struct zram *zram, struct zram_pp_slot *pps);
+#endif
+
 #endif
